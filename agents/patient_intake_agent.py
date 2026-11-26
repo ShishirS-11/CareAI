@@ -9,6 +9,7 @@ from typing import Any
 from config.settings import get_settings
 from schemas.symptom_schema import PatientIntakeResult
 from services.patient_context_service import PatientContextService
+from services.symptom_polarity import reconcile_associated_symptoms
 
 
 logger = logging.getLogger(__name__)
@@ -242,16 +243,14 @@ RELEVANT PATIENT CONTEXT (de-identified):
         elif re.search(r"\bleft\b", lower):
             set_if_missing("side", "left")
 
-        associated = symptoms.get("associated_symptoms")
-        associated = list(associated) if isinstance(associated, list) else []
-        for phrase, canonical in (
-            ("slight swelling", "slight swelling"), ("swelling", "swelling"),
-            ("swollen", "swelling"), ("fever", "fever"), ("numbness", "numbness"),
-            ("tingling", "tingling"), ("redness", "redness"), ("warmth", "warmth"),
-        ):
-            if phrase in lower and canonical not in associated:
-                associated.append(canonical)
+        associated, denied = reconcile_associated_symptoms(
+            symptoms.get("associated_symptoms", []), text
+        )
         symptoms["associated_symptoms"] = associated
+        existing_denied = symptoms.get("explicitly_denied_symptoms", [])
+        if not isinstance(existing_denied, list):
+            existing_denied = []
+        symptoms["explicitly_denied_symptoms"] = list(dict.fromkeys(existing_denied + denied))
 
         triggers = symptoms.get("triggers")
         triggers = list(triggers) if isinstance(triggers, list) else []

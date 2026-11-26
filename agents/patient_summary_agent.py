@@ -4,6 +4,8 @@ from typing import Any
 import json
 import re
 
+from services.symptom_polarity import reconcile_associated_symptoms
+
 from agents._gemini_agent import GeminiJSONAgent
 
 
@@ -142,6 +144,7 @@ class PatientSummaryAgent:
             ("Description", ", ".join(symptoms.get("character") or []) if isinstance(symptoms.get("character"), list) else symptoms.get("character")),
             ("Triggers", ", ".join(symptoms.get("triggers") or []) if isinstance(symptoms.get("triggers"), list) else symptoms.get("triggers")),
             ("Associated symptoms", ", ".join(symptoms.get("associated_symptoms") or []) if isinstance(symptoms.get("associated_symptoms"), list) else symptoms.get("associated_symptoms")),
+            ("Explicitly denied symptoms", ", ".join(symptoms.get("explicitly_denied_symptoms") or []) if isinstance(symptoms.get("explicitly_denied_symptoms"), list) else symptoms.get("explicitly_denied_symptoms")),
             ("Impact", ", ".join(symptoms.get("functional_impact") or []) if isinstance(symptoms.get("functional_impact"), list) else symptoms.get("functional_impact")),
         ]
         return "\n".join(
@@ -149,6 +152,78 @@ class PatientSummaryAgent:
             for label, value in fields
             if value not in (None, "", [], {})
         ) or "The symptom timeline has not been fully recorded."
+
+    @classmethod
+    def _format_record(cls, item: Any, kind: str = "record") -> str:
+        """Render a structured patient record as readable clinical text."""
+        if not isinstance(item, dict):
+            return str(item).strip()
+
+        def first(*keys: str) -> str:
+            for key in keys:
+                value = item.get(key)
+                if value not in (None, "", [], {}):
+                    if isinstance(value, list):
+                        return ", ".join(str(part) for part in value)
+                    if isinstance(value, dict):
+                        continue
+                    return str(value).strip()
+            return ""
+
+        if kind == "medication":
+            name = first("medication_name", "name", "title") or "Medication"
+            details = []
+            for label, keys in (
+                ("dose", ("dosage", "dose")),
+                ("frequency", ("frequency", "dose_frequency")),
+                ("started", ("started_on", "start_date")),
+                ("source", ("source",)),
+            ):
+                value = first(*keys)
+                if value:
+                    details.append(f"{label}: {value}")
+            notes = first("notes", "instructions")
+            result = name
+            if details:
+                result += " (" + "; ".join(details) + ")"
+            if notes:
+                result += f" — {notes}"
+            return result
+
+        if kind == "history":
+            title = first("title", "condition_name", "name") or "Medical history record"
+            details = first("details", "description", "notes")
+            date = first("record_date", "diagnosed_on", "date")
+            status = first("status")
+            metadata = []
+            if date:
+                metadata.append(date)
+            if status:
+                metadata.append(status)
+            result = title
+            if metadata:
+                result += " (" + "; ".join(metadata) + ")"
+            if details:
+                result += f" — {details}"
+            return result
+
+        # Generic allergy or other patient-record entry.
+        preferred = first("allergen", "allergy_name", "name", "title", "medication_name")
+        if preferred:
+            extra = first("reaction", "severity", "notes", "details")
+            return f"{preferred} — {extra}" if extra else preferred
+        return "; ".join(
+            f"{str(key).replace('_', ' ').capitalize()}: {value}"
+            for key, value in item.items()
+            if value not in (None, "", [], {}) and not isinstance(value, dict)
+        ) or "Record details unavailable"
+
+    @classmethod
+    def _format_records(cls, items: Any, kind: str = "record") -> list[str]:
+        return [
+            text for text in (cls._format_record(item, kind) for item in cls._list(items))
+            if text
+        ]
 
     @classmethod
     def _doctor_notes(cls, generated_notes: Any, symptoms: dict, intake: dict,
@@ -160,44 +235,52 @@ class PatientSummaryAgent:
             if notes:
                 return "\n".join(f"- {item}" for item in notes)
 
-        # Safe local fallback: report known facts and explicitly label unknowns.
-        lines = []
+        # Build Markdown deliberately: section labels are not list items, and
+        # each section contains only ordinary bullet points. This avoids nested
+        # or auto-numbered lists in Streamlit's Markdown renderer.
+        blocks: list[str] = []
         complaint = symptoms.get("complaint") or intake.get("chief_complaint") or intake.get("symptom")
+        presenting_lines = []
         if complaint:
-            lines.append(f"Presenting problem (patient-reported): {complaint}")
+            presenting_lines.append(f"- **Presenting problem (patient-reported):** {complaint}")
         for label, key in (
             ("Location", "body_location"), ("Side", "side"), ("Onset", "onset"),
             ("Duration", "duration"), ("Severity", "severity"),
             ("Associated symptoms", "associated_symptoms"),
+            ("Explicitly denied symptoms", "explicitly_denied_symptoms"),
             ("Triggers/context", "triggers"), ("Functional impact", "functional_impact"),
         ):
             value = symptoms.get(key)
             if value not in (None, "", [], {}, "unknown", "not_applicable"):
                 if isinstance(value, list):
                     value = ", ".join(str(item) for item in value)
-                lines.append(f"{label}: {value}")
+                presenting_lines.append(f"- **{label}:** {value}")
+        if presenting_lines:
+            blocks.append("\n".join(presenting_lines))
 
-        patient_context = intake.get("patient_context_used") or {}
-        if isinstance(patient_context, dict):
-            history_items = patient_context.get("matched_history") or []
-        else:
-            history_items = []
-        lines.append(
-            "Relevant medical history: " + (
-                "; ".join(str(item) for item in history_items) if history_items
-                else "Not available in the information provided; absence of history is not confirmed."
-            )
-        )
-        allergies = research.get("allergies") or []
-        meds = research.get("current_medications") or []
-        lines.append("Allergies: " + (", ".join(str(x) for x in allergies) if allergies else "Not confirmed"))
-        lines.append("Current medications: " + (", ".join(str(x) for x in meds) if meds else "Not confirmed"))
+        # Use deterministic record evidence passed by the research stage.
+        sections = [
+            ("Relevant medical history", cls._format_records(research.get("patient_record_evidence"), "history"),
+             "No previously recorded conditions matched the current complaint in the available records."),
+            ("Other existing medical history", cls._format_records(research.get("other_patient_record_evidence"), "history"),
+             "No other history was returned by the available record query."),
+            ("Allergies", cls._format_records(research.get("allergies"), "allergy"),
+             "No allergy information is recorded; allergy status is unconfirmed."),
+            ("Current medications", cls._format_records(research.get("current_medications"), "medication"),
+             "No current medications are recorded."),
+            ("Previous prescriptions", cls._format_records(research.get("historical_prescriptions"), "medication"),
+             "No previous prescriptions are recorded."),
+        ]
+        for heading, entries, empty_text in sections:
+            bullets = entries or [empty_text]
+            blocks.append(f"**{heading}**\n" + "\n".join(f"- {entry}" for entry in bullets))
+
         mechanism = symptoms.get("injury_or_event")
         if mechanism not in (None, "", [], {}):
-            lines.append(f"Injury/event (patient-reported or recorded): {mechanism}")
+            blocks.append(f"- **Injury/event (patient-reported or recorded):** {mechanism}")
         else:
-            lines.append("Specific injury mechanism: Not established from the available information.")
-        return "\n".join(f"- {line}" for line in lines) if lines else "- No patient details were available for the clinician handoff."
+            blocks.append("- **Specific injury mechanism:** Not established from the available information.")
+        return "\n\n".join(blocks) if blocks else "No patient details were available for the clinician handoff."
 
     def run(
         self,
@@ -235,15 +318,17 @@ class PatientSummaryAgent:
                 symptoms["side"] = "right"
             elif re.search(r"\bleft\b", lower_transcript):
                 symptoms["side"] = "left"
-        associated = symptoms.get("associated_symptoms")
-        associated = list(associated) if isinstance(associated, list) else []
-        for phrase, canonical in (("slight swelling", "slight swelling"), ("swelling", "swelling"),
-                                  ("swollen", "swelling"), ("fever", "fever"),
-                                  ("numbness", "numbness"), ("tingling", "tingling")):
-            if phrase in lower_transcript and canonical not in associated:
-                associated.append(canonical)
-        if associated:
+        associated, denied = reconcile_associated_symptoms(
+            symptoms.get("associated_symptoms", []), transcript
+        )
+        if associated or "associated_symptoms" in symptoms:
             symptoms["associated_symptoms"] = associated
+        existing_denied = symptoms.get("explicitly_denied_symptoms", [])
+        if not isinstance(existing_denied, list):
+            existing_denied = []
+        combined_denied = list(dict.fromkeys(existing_denied + denied))
+        if combined_denied or "explicitly_denied_symptoms" in symptoms:
+            symptoms["explicitly_denied_symptoms"] = combined_denied
 
         triggers = symptoms.get("triggers")
         triggers = list(triggers) if isinstance(triggers, list) else []
@@ -345,6 +430,15 @@ For remedies_self_care:
 - Return practical, brief steps that are relevant to this patient's complaint;
   do not return a generic disclaimer instead of the requested information.
 
+For medical history:
+- Use the supplied patient_record_evidence only under relevant history.
+- Use other_patient_record_evidence only under other existing medical history.
+- Never move unrelated history into the relevant-history section.
+- If no records match the complaint domain, state that no previously recorded
+  history related to this complaint was found in the available records.
+- Keep all current medications, allergies and historical prescriptions in their
+  own sections; do not imply they are related to the current complaint.
+
 For doctor_notes:
 - Write a concise handoff in bullet points: presenting problem, timeline,
   side/location, associated symptoms, functional impact, relevant history,
@@ -376,6 +470,7 @@ Input data:
             generated = {}
 
         history = self._list(research_result.get("patient_record_evidence"))
+        other_history = self._list(research_result.get("other_patient_record_evidence"))
         allergies = self._list(research_result.get("allergies"))
         current_meds = self._list(research_result.get("current_medications"))
         previous_rx = self._list(research_result.get("historical_prescriptions"))
@@ -414,12 +509,17 @@ Input data:
         report = {
             "title": self._text(generated.get("title"), "Consultation summary"),
             "presenting_concern": self._text(generated.get("presenting_concern"), default_concern),
-            "symptom_details": generated.get("symptom_details") if isinstance(generated.get("symptom_details"), dict) else symptoms,
+            "symptom_details": symptoms,
             "symptom_timeline": self._timeline(symptoms),
-            "relevant_history": self._list(generated.get("relevant_history", history)),
-            "allergies": self._list(generated.get("allergies", allergies)),
-            "current_medications": self._list(generated.get("current_medications", current_meds)),
-            "previous_prescriptions": self._list(generated.get("previous_prescriptions", previous_rx)),
+            # Retrieved patient records are authoritative; the LLM may explain them
+            # but cannot invent, move, or remove records from these sections.
+            "relevant_history": history,
+            "other_medical_history": other_history,
+            "history_relevance_status": research_result.get("history_relevance_status", "unknown"),
+            "complaint_domains": self._list(research_result.get("complaint_domains")),
+            "allergies": allergies,
+            "current_medications": current_meds,
+            "previous_prescriptions": previous_rx,
             "automated_safety_screen": safety_result,
             "suggested_department": self._text(generated.get("suggested_department"), department),
             "department_reason": self._text(generated.get("department_reason"), department_reason),
@@ -439,8 +539,7 @@ Input data:
                 else "Seek urgent medical assessment if symptoms become severe, sudden, rapidly worsen, or are accompanied by other concerning symptoms. If you think this may be an emergency, seek emergency care immediately."
             ),
             "doctor_notes": self._doctor_notes(
-                generated.get("doctor_notes"), symptoms, patient_intake,
-                research_result, conversation_history
+                None, symptoms, patient_intake, research_result, conversation_history
             ),
             "self_care_evidence": self_care_evidence,
             "warning_signs_evidence": warning_evidence,
@@ -463,8 +562,9 @@ Input data:
                 symptoms.get("patient_stated_history", []),
                 "No additional patient-stated details were separately recorded."
             ),
-            "## Relevant medical history\n" + self._bullets(report["relevant_history"], "No relevant patient records were matched."),
-            "## Allergies\n" + self._bullets(report["allergies"], "No allergies are recorded. This does not confirm that none exist."),
+            "## Relevant medical history\n" + self._bullets(report["relevant_history"], "No previously recorded conditions related to this complaint were found in the available records."),
+            "## Other existing medical history\n" + self._bullets(report["other_medical_history"], "No other history was returned by the available record query."),
+            "## Allergies\n" + self._bullets(report["allergies"], "No allergy information is recorded. This does not confirm that no allergies exist."),
             "## Current medications\n" + self._bullets(report["current_medications"], "No current medications are recorded."),
             "## Previous prescriptions\n" + self._bullets(report["previous_prescriptions"], "No previous prescriptions are recorded."),
             "## Suggested department\n" + report["suggested_department"] + "\n\n" + report["department_reason"],

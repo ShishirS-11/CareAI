@@ -74,6 +74,23 @@ class PatientContextService:
         # image_observations are intentionally never included.
         return " ".join(parts)
 
+    DOMAIN_TERMS = {
+        "gastrointestinal": ("stomach", "abdominal", "abdomen", "digestive", "gastro", "gastric", "acidity", "acid reflux", "reflux", "gerd", "heartburn", "bloating", "indigestion", "nausea", "vomiting", "diarrhoea", "diarrhea", "constipation", "bowel", "intestine", "ulcer", "liver", "pancreas"),
+        "musculoskeletal": ("knee", "osteoarthritis", "arthritis", "joint", "orthopaedic", "orthopedic", "bone", "fracture", "meniscus", "ligament", "tendon", "muscle", "shoulder", "ankle", "wrist", "elbow", "hip", "back", "spine", "neck", "foot", "hand"),
+        "cardiovascular": ("heart", "cardiac", "cardiovascular", "chest pain", "blood pressure", "hypertension", "arrhythmia", "coronary", "angina", "cholesterol"),
+        "respiratory": ("respiratory", "lung", "asthma", "copd", "bronchitis", "pneumonia", "cough", "breathlessness"),
+        "neurological": ("neurology", "neurological", "brain", "stroke", "seizure", "epilepsy", "migraine", "headache", "nerve", "numbness", "tingling"),
+        "endocrine_metabolic": ("diabetes", "thyroid", "endocrine", "glucose", "insulin", "metabolic"),
+        "genitourinary": ("urinary", "urine", "kidney", "renal", "bladder", "urology", "uti"),
+        "dermatological": ("skin", "dermatology", "rash", "eczema", "psoriasis", "acne"),
+    }
+
+    @classmethod
+    def _domains(cls, text: str) -> set[str]:
+        normalised = cls._normalise(text)
+        return {domain for domain, terms in cls.DOMAIN_TERMS.items()
+                if any(cls._normalise(term) in normalised for term in terms)}
+
     def retrieve(self, current_message: str, limit: int = 12) -> dict:
         conditions = self._rows("health_conditions")
         allergies = self._rows("patient_allergies")
@@ -94,26 +111,23 @@ class PatientContextService:
         for row in extraction_rows:
             extraction_by_doc.setdefault(str(row.get("document_id")), row)
 
-        candidates: list[tuple[int, dict]] = []
+        complaint_domains = self._domains(current_message)
+        records: list[dict] = []
+
         def add_rows(rows, record_type, title_key, date_key, source, detail_keys, historical=False):
             for row in rows:
                 title = str(row.get(title_key) or record_type.replace("_", " ").title())
                 details = " ".join(str(row.get(key) or "") for key in detail_keys).strip()
-                score = self._relevance(current_message, f"{title} {details}")
-                if score <= 0:
-                    continue
-                candidates.append((score, {
+                records.append({
                     "record_id": str(row.get("id")) if row.get("id") else None,
                     "record_type": record_type, "title": title,
                     "record_date": str(row.get(date_key)) if date_key and row.get(date_key) else None,
                     "status": str(row.get("status")) if row.get("status") else ("historical" if historical else None),
-                    "details": details[:500], "source": source,
-                    "relevance_reason": f"Matched {score} term(s) from the current complaint against this patient record.",
-                }))
+                    "details": details[:700], "source": source,
+                })
 
         add_rows(conditions, "health_condition", "condition_name", "diagnosed_on", "patient health records", ("status", "notes", "diagnosed_on"))
         add_rows(timeline, "health_timeline_event", "title", "event_date", "patient timeline", ("event_type", "details"))
-        add_rows(previous_rx, "previous_prescription", "medication_name", "prescribed_on", "previous prescriptions", ("dosage", "frequency", "prescribed_for", "notes"), True)
 
         for doc in documents:
             doc_type = self._document_type(doc)
@@ -125,30 +139,43 @@ class PatientContextService:
                 extracted = {}
             structured_text = self._extract_structured_text(extracted)
             title = str(doc.get("file_name") or doc.get("document_name") or doc.get("document_type") or "Medical document")
-            score = self._relevance(current_message, " ".join((title, str(doc.get("document_type") or ""), structured_text)))
-            if score < 2:
+            if not structured_text and not self._domains(title):
                 continue
-            candidates.append((score, {
+            records.append({
                 "record_id": str(doc.get("id")) if doc.get("id") else None,
                 "record_type": "medical_document", "title": title,
                 "record_date": str(extracted.get("document_date") or doc.get("document_date") or "") or None,
                 "status": "AI-extracted; not independently clinically verified",
-                "details": structured_text[:700],
+                "details": structured_text[:900],
                 "source": "uploaded clinical document and structured AI extraction",
-                "relevance_reason": f"Matched {score} meaningful term(s) in the clinical document's structured content.",
-            }))
+            })
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
+        relevant_history, other_history = [], []
+        for record in records:
+            record_domains = self._domains(record.get("title", "") + " " + record.get("details", ""))
+            record["clinical_domains"] = sorted(record_domains)
+            if complaint_domains and record_domains.intersection(complaint_domains):
+                record["relevance_reason"] = ("Same broad clinical domain as the current complaint; this does not establish that the record explains the current symptoms.")
+                relevant_history.append(record)
+            else:
+                record["relevance_reason"] = ("Existing patient history retained for clinician context; a direct relationship to the current complaint was not established.")
+                other_history.append(record)
+
+        relevant_history = relevant_history[:max(1, limit)]
+        other_history = other_history[:100]
         limitations = []
         if not extraction_table_available:
             limitations.append("Structured document extraction records were unavailable or the extraction table could not be queried.")
         limitations.extend([
-            "Uploaded documents are matched conservatively by document type and text overlap. A missing match does not prove that no relevant record exists.",
+            "History relevance uses broad keyword/domain matching, not clinical judgement. Records classified as other history may still matter clinically.",
             "AI-extracted document content is not independently clinically verified.",
             "Raw clinical-image observations are excluded from the medical-history match.",
         ])
         return {
-            "matched_history": [item for _, item in candidates[:max(1, limit)]],
+            "matched_history": relevant_history,
+            "other_history": other_history,
+            "complaint_domains": sorted(complaint_domains),
+            "history_relevance_status": "classified" if complaint_domains else "domain_uncertain",
             "allergies": [{key: row.get(key) for key in ("allergen", "reaction", "severity", "notes", "source", "created_at")} for row in allergies],
             "current_medications": [{key: row.get(key) for key in ("medication_name", "dosage", "frequency", "started_on", "ended_on", "notes", "source")} for row in current_meds],
             "historical_prescriptions": [{key: row.get(key) for key in ("medication_name", "dosage", "frequency", "prescribed_on", "prescribed_for", "notes")} for row in previous_rx],

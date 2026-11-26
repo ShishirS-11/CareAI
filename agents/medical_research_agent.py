@@ -287,6 +287,9 @@ class MedicalResearchAgent:
         # Review metadata is retained as provenance, not used as a display gate.
         return {
             "patient_record_evidence": history[:10] if isinstance(history, list) else [],
+            "other_patient_record_evidence": context.get("other_history", []) if isinstance(context.get("other_history", []), list) else [],
+            "complaint_domains": context.get("complaint_domains", []),
+            "history_relevance_status": context.get("history_relevance_status", "unknown"),
             "allergies": allergies if isinstance(allergies, list) else [],
             "current_medications": medications if isinstance(medications, list) else [],
             "historical_prescriptions": prescriptions if isinstance(prescriptions, list) else [],
