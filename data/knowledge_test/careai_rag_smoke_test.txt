@@ -1,0 +1,12 @@
+﻿CareAI RAG Integration Test
+
+This is a synthetic test document created to verify the CareAI
+medical knowledge retrieval pipeline.
+
+The system uses document chunking, Gemini embeddings,
+Supabase PostgreSQL, and pgvector similarity search.
+
+This document contains no clinical recommendations,
+medical advice, diagnosis, or treatment information.
+
+Document purpose: Technical integration testing only.
